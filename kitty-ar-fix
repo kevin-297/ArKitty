@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Full Arabic-in-kitty test suite (v2).
+
+Usage:
+    python ar-test-full            run everything
+    python ar-test-full 2 3        run only groups 2 and 3
+    python ar-test-full --check    only the automatic round-trip check
+    python ar-test-full exp        side-by-side experiments for the unsure cases
+
+Reading the output: each case prints an id, an `expect:` line saying what a correct
+render looks like, then the rendered line. Arabic reads right to left, so the FIRST
+word must be at the RIGHT edge, letters joined and in order, numbers reading normally.
+Send back the ids of the wrong lines.
+"""
+import re
+import sys
+import textwrap
+import unicodedata
+
+import arabic_reshaper
+
+# --------------------------------------------------------------------------- #
+# THE FIX (copy this block into your real script)
+# --------------------------------------------------------------------------- #
+DIGITS_MODE = "split"   # chosen from the experiments: keeps Arabic-Indic digits as they are
+PUNCT_MODE = "move"     # chosen from the experiments (asis | move | space)
+
+DIGIT_CHARS = "0-9\u0660-\u0669\u06F0-\u06F9"
+ARB = "\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF"
+ARAB_PUNCT = "\u060C\u061B\u061F"          # ،  ؛  ؟
+
+reshaper = arabic_reshaper.ArabicReshaper(configuration={
+    "delete_harakat": True,       # diacritics attach to the wrong cell after reordering
+    "delete_tatweel": True,       # the stretch bar renders as '_' in a cell grid
+    "support_ligatures": True,
+})
+_MARKS = re.compile("[\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]")   # invisible bidi marks
+_TO_ASCII = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "0123456789" * 2)
+_latin = re.compile(r"[A-Za-z]")
+_ARDIG = re.compile("[\u0660-\u0669\u06F0-\u06F9]")      # Arabic-Indic / Persian digits
+
+
+def _regexes(digits_are_letters):
+    letters = f"[{ARB}]" if digits_are_letters else f"(?:(?![{DIGIT_CHARS}])[{ARB}])"
+    other = f"(?:(?!{letters}).)"
+    return re.compile(f"{letters}+|{other}+", re.S), re.compile(letters)
+
+
+_R = {True: _regexes(True), False: _regexes(False)}
+
+
+def _flip_runs(word, runs, has):
+    """In a token that mixes Arabic letters with other stuff (12د, -42د, 50%د),
+    reverse every non-Arabic run in place: kitty draws the whole token right to left."""
+    parts = runs.findall(word)
+    if len(parts) > 1 and any(has.search(p) for p in parts):
+        return "".join(p if has.search(p) else p[::-1] for p in parts)
+    return word
+
+
+_AD = "\u0660-\u0669\u06F0-\u06F9"
+_NUM = re.compile(rf"([{_AD}]+(?:[:.,/\u066B\u066C][{_AD}]+)*)")      # a number: ١٢:٣٠ , ٣٫٥
+_ADRUN = re.compile(rf"[{_AD}]+")
+
+
+def _one(w, runs, has, digits):
+    """Per-token fix. In 'flipall' mode a token made only of Arabic-Indic digits and
+    symbols (١٢:٣٠) is reversed whole, because kitty draws it right to left too."""
+    if digits == "flipall" and not has.search(w) and _ARDIG.search(w):
+        return w[::-1]
+    if digits in ("rev", "split") and _ARDIG.search(w):
+        # kitty reverses every run of Arabic-script digits in place and lays it out as
+        # its own piece, so: reverse each digit run in place ...
+        pieces = [p for p in _NUM.split(w) if p]
+        out = [_ADRUN.sub(lambda m: m.group()[::-1], p) if _NUM.fullmatch(p)
+               else _flip_runs(p, runs, has) for p in pieces]
+        if digits == "split" and has.search(w):      # ... and, next to letters, swap the pieces
+            out.reverse()
+        return "".join(out)
+    return _flip_runs(w, runs, has)
+
+
+def _punct(word, mode):
+    """Arabic punctuation glued to a word (بخير؟) -> list of tokens."""
+    if mode == "asis":
+        return [word]
+    m = re.match(rf"^([{ARAB_PUNCT}]*)(.*?)([{ARAB_PUNCT}]*)$", word, re.S)
+    lead, core, trail = m.groups()
+    if not (lead or trail) or not core:
+        return [word]
+    if mode == "move":                      # swap the punctuation to the other end
+        return [trail + core + lead]
+    return [t for t in (lead, core, trail) if t]      # "space": separate tokens
+
+
+def _reorder(words, has):
+    """Reverse the word order, but keep consecutive Latin words in their own order."""
+    is_latin = lambda w: bool(_latin.search(w)) and not has.search(w)
+    groups = []
+    for w in words:
+        if groups and is_latin(w) and is_latin(groups[-1][-1]):
+            groups[-1].append(w)
+        else:
+            groups.append([w])
+    return " ".join(" ".join(g) for g in reversed(groups))
+
+
+def fix(line, digits=None, punct=None):
+    digits, punct = digits or DIGITS_MODE, punct or PUNCT_MODE
+    line = _MARKS.sub("", line)
+    if digits == "ascii":
+        line = line.translate(_TO_ASCII)
+    runs, has = _R[digits == "asis"]
+    if not has.search(line) and not (digits in ("flipall", "rev", "split") and _ARDIG.search(line)):
+        return line                          # no Arabic: leave the line alone
+    words = []
+    for w in reshaper.reshape(line).split():
+        words.extend(_punct(w, punct))
+    words = [_one(w, runs, has, digits) for w in words]
+    return _reorder(words, has)
+
+
+def unfix(text):
+    """Undo fix(): visual text back to logical text, full lines.
+    Digits stay ASCII in ascii mode (the original Arabic-Indic style cannot be recovered)."""
+    runs, has = _R[DIGITS_MODE == "asis"]
+    text = unicodedata.normalize("NFKC", text)
+    if not has.search(text) and not (DIGITS_MODE in ("flipall", "rev", "split") and _ARDIG.search(text)):
+        return text
+    words = []
+    for w in text.split():
+        words.extend(_punct(_one(w, runs, has, DIGITS_MODE), "move" if PUNCT_MODE == "move" else "asis"))
+    return _reorder(words, has)
+
+
+def cells(parts):
+    return "  ".join(fix(p) for p in parts)
+
+
+def fix_wrapped(text, width):
+    """Wrap the LOGICAL text first, then fix each line and right-align it.
+    Use this instead of letting kitty wrap a long line (kitty wraps the visual text)."""
+    lines = textwrap.wrap(text, width=width, break_long_words=False) or [""]
+    return "\n".join(fix(l).rjust(width) for l in lines)
+
+
+# --------------------------------------------------------------------------- #
+# Test cases: (group, id, logical text, what a correct render reads like)
+# --------------------------------------------------------------------------- #
+CASES = [
+    # ---- 1. pure Arabic letters ------------------------------------------- #
+    (1, "1a", "السلام", "one word 'assalam', letters joined"),
+    (1, "1b", "السلام عليكم ورحمة الله وبركاته", "5 words, 'assalam' at the RIGHT edge"),
+    (1, "1c", "لا إله إلا الله", "lam-alef ligatures in 'la/ila/illa' + the Allah ligature"),
+    (1, "1d", "وزارة دار ذهب رزق", "non-joining letters (و ز ر د ذ) leave gaps, rest joined"),
+    (1, "1e", "مدرسة جميلة مكتبة", "taa marbuta at word ends (ة), joined"),
+    (1, "1f", "على موسى يحيى مستشفى", "alef maqsura / final yaa (ى ي)"),
+    (1, "1g", "كتـــاب", "tatweel is deleted: plain joined 'kitab', no underscores"),
+    (1, "1h", "أحمد إبراهيم آمنة مؤمن", "hamza forms (أ إ آ ؤ)"),
+    (1, "1i", "السَّلَامُ عَلَيْكُمْ", "diacritics are stripped: plain 'assalamu alaykum'"),
+    (1, "1j", "پارسی چای گل ژاله", "Persian letters (پ چ گ ژ)"),
+    (1, "1k", "ب", "single letter, isolated form"),
+    (1, "1l", "ببب", "same letter x3: initial, medial, final forms"),
+    (1, "1m", "ء ؤ ئ", "hamza alone and on carriers"),
+
+    # ---- 2. digits glued / separate --------------------------------------- #
+    (2, "2a", "الظهر 12:22", "'alzuhr' at right, time 12:22 on the left"),
+    (2, "2b", "العصر 15:38", "time reads 15:38"),
+    (2, "2c", "الخميس 01 أكتوبر 2026", "Thursday 01 October 2026, day at right"),
+    (2, "2d", "بعد 3س 12د", "after 3h 12m: digits read 12 (not 21), the letter د sits LEFT of the number"),
+    (2, "2e", "منذ 2س 45د", "since 2h 45m: digits read 45 (not 54), the letter د sits LEFT of the number"),
+    (2, "2f", "د12", "د is rightmost, the number sits to its LEFT and reads 12 (not 21)"),
+    (2, "2g", "1د2س", "one token 1د2س read right to left: 1, then د, then 2, then س"),
+    (2, "2h", "الساعة ١٢:٣٠", "Arabic-Indic digits, time reads ١٢:٣٠ (twelve thirty)"),
+    (2, "2i", "مدة ۱۲د", "word at right, then the Persian number ۱۲ with د to its LEFT, reads ۱۲ not ۲۱"),
+    (2, "2j", "ثانية59", "word rightmost, 59 to its LEFT, reads 59 (not 95)"),
+    (2, "2k", "الرقم 1234567890", "long digit run reads 1234567890"),
+    (2, "2l", "رقم1234", "word rightmost, 1234 to its LEFT, reads 1234 (not 4321)"),
+    (2, "2m", "ال12ظهر", "digits INSIDE a word (ugly but must not crash)"),
+    (2, "2n", "الظهر 12 15", "two separate numbers in a row"),
+    (2, "2o", "٣س ٢٠د", "3h 20m with Arabic-Indic digits: the number reads ٢٠ (not ٠٢)"),
+
+    # ---- 3. signs and punctuation ----------------------------------------- #
+    (3, "3a", "الظهر -42 د", "countdown: -42 keeps minus on the left of 42"),
+    (3, "3b", "الفجر +12 د", "elapsed: +12 keeps plus on the left of 12"),
+    (3, "3c", "-42د", "د at the far LEFT, then '-42' with the minus on the LEFT of 42"),
+    (3, "3d", "+12د", "د at the far LEFT, then '+12' with the plus on the LEFT of 12"),
+    (3, "3e", "نسبة 50%", "percent sign stays right of 50"),
+    (3, "3f", "نسبة50%د", "left to right on screen: د  50%  نسبة  (word rightmost, % right of 50)"),
+    (3, "3g", "درجة 3.5", "decimal 3.5, not 5.3"),
+    (3, "3h", "التاريخ 2026/10/01", "date with slashes reads 2026/10/01"),
+    (3, "3i", "الساعة 04:54:30", "hh:mm:ss"),
+    (3, "3j", "بعد 1,200 ثانية", "thousands separator 1,200"),
+    (3, "3k", "التالي: الظهر 12:22 · بعد 3س 12د", "your 'next prayer' line, label at the right"),
+    (3, "3l", "السابق: الفجر 04:54 · منذ 2س 45د", "your 'previous prayer' line"),
+    (3, "3m", "(الظهر)", "parentheses around a word; check which side each paren is on"),
+    (3, "3n", "«الفجر» و\"العصر\"", "guillemets and straight quotes around words"),
+    (3, "3o", "الظهر، العصر، المغرب", "Arabic comma at the LEFT end of each word"),
+    (3, "3p", "هل أنت بخير؟ نعم؛ حسنا", "؟ at the LEFT end of بخير, ؛ at the LEFT end of نعم (see: exp)"),
+    (3, "3q", "الصلاة…", "ellipsis after a word"),
+    (3, "3r", "الظهر - العصر", "spaced hyphen between words"),
+    (3, "3s", "الظهر – العصر", "en dash between words"),
+    (3, "3t", "[الظهر] {العصر}", "square and curly brackets"),
+    (3, "3u", "الظهر: 12:22", "colon after a word, then a time"),
+    (3, "3v", "12:22 :الظهر", "colon BEFORE the word (already visual order, see what happens)"),
+
+    # ---- 4. mixed with Latin ---------------------------------------------- #
+    (4, "4a", "Fajr الفجر", "Fajr at the right (it is FIRST in logical order)"),
+    (4, "4b", "الفجر (Fajr)", "'alfajr' at right, '(Fajr)' on the left"),
+    (4, "4c", "المسجد kitty terminal", "'kitty terminal' keeps its order (kitty then terminal, left to right)"),
+    (4, "4d", "البريد a@b.com", "email stays intact"),
+    (4, "4e", "الرابط https://example.com/ar", "URL stays intact"),
+    (4, "4f", "Hello world", "pure Latin: unchanged, reads 'Hello world'"),
+    (4, "4g", "abc123", "pure Latin + digits: unchanged"),
+    (4, "4h", "ملف file_1.txt جديد", "file name stays intact between two words"),
+    (4, "4i", "الإصدار v2.1.0", "version string intact"),
+    (4, "4j", "السرعة 50km/h", "unit glued to digits, Latin"),
+    (4, "4k", "12:22", "pure time: unchanged"),
+    (4, "4l", "الظهر Dhuhr 12:22", "Arabic + Latin word + time"),
+    (4, "4m", "افتح open the file الآن", "'open the file' is one Latin phrase and keeps its order"),
+
+    # ---- 5. whitespace / empty / odd input -------------------------------- #
+    (5, "5a", "", "empty line (nothing between the dashes)"),
+    (5, "5b", "   ", "spaces only"),
+    (5, "5c", "  الظهر   العصر  ", "[KNOWN LIMIT] extra spaces collapse to single spaces"),
+    (5, "5d", "الظهر\tالعصر", "tab between words turns into a space"),
+    (5, "5e", "الظهر\u00a012", "non-breaking space between word and number"),
+    (5, "5f", "الظهر\u200f 12", "RLM is stripped: plain 'alzuhr 12', letters joined, no gap"),
+    (5, "5g", "الظهر\u200e 12", "LRM is stripped: plain 'alzuhr 12', letters joined, no gap"),
+    (5, "5h", "ا", "single non-joining letter"),
+    (5, "5i", "1", "single digit only"),
+    (5, "5j", ".", "single punctuation"),
+
+    # ---- 6. symbols, emoji, ZWNJ, bar graphics ---------------------------- #
+    (6, "6a", "🕌 الظهر", "mosque emoji first (rightmost), then the word"),
+    (6, "6b", "الظهر ● 12:22", "bullet between word and time"),
+    (6, "6c", "الظهر ↑ ↓", "arrows (direction not mirrored)"),
+    (6, "6d", "می‌خواهم", "ZWNJ between two Persian parts: 'mi-khaham'"),
+    (6, "6e", "█████░░░░░ 50% الظهر", "progress bar glyphs + percent + word"),
+    (6, "6f", "الظهر █████░░░░░ 50%", "word first, then bar, then percent"),
+    (6, "6g", "→ الظهر ←", "arrows around a word"),
+    (6, "6h", "★ الفجر ★ الظهر ★", "stars as separators"),
+    (6, "6i", "الظهر ٪٢٥", "Arabic percent sign U+066A"),
+    (6, "6j", "ﷲ", "the Allah ligature character itself"),
+    (6, "6k", "ﷺ", "salawat ligature character itself"),
+
+    # ---- 7. long line ------------------------------------------------------ #
+    (7, "7a", " ".join(["السلام عليكم ورحمة الله وبركاته"] * 4),
+     "[KNOWN LIMIT] kitty's own wrapping swaps the halves (see 7b for the fix)"),
+]
+
+# --------------------------------------------------------------------------- #
+# Output helpers
+# --------------------------------------------------------------------------- #
+DIM = "\033[2m" if sys.stdout.isatty() else ""
+BOLD = "\033[1m" if sys.stdout.isatty() else ""
+OFF = "\033[0m" if sys.stdout.isatty() else ""
+GROUPS = {
+    1: "PURE ARABIC LETTERS (joining, ligatures, hamza, harakat)",
+    2: "DIGITS (separate, glued, Arabic-Indic, Persian)",
+    3: "SIGNS AND PUNCTUATION",
+    4: "MIXED WITH LATIN",
+    5: "WHITESPACE AND ODD INPUT",
+    6: "SYMBOLS, EMOJI, ZWNJ, BAR GRAPHICS",
+    7: "LONG LINE",
+}
+
+
+def norm(text):
+    """What unfix(fix(x)) should give back: NFKC, no diacritics/marks/tatweel, single spaces."""
+    t = unicodedata.normalize("NFKC", text)
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    t = _MARKS.sub("", t).replace("\u0640", "")
+    return " ".join(t.split())
+
+
+def visual_check(wanted):
+    last = None
+    for group, cid, text, expect in CASES:
+        if wanted and group not in wanted:
+            continue
+        if group != last:
+            print(f"\n{BOLD}== {group}. {GROUPS[group]} =={OFF}")
+            last = group
+        print(f"{cid}  {DIM}expect: {expect}{OFF}")
+        print(f"    -{fix(text)}-" if not text.strip() else f"    {fix(text)}")
+    if not wanted or 7 in wanted:
+        print(f"7b  {DIM}expect: same text wrapped by us at 50 cols, each line right-aligned, "
+              f"first line = start of the sentence{OFF}")
+        long_text = " ".join(["السلام عليكم ورحمة الله وبركاته"] * 4)
+        print("\n".join("    " + l for l in fix_wrapped(long_text, 50).split("\n")))
+
+
+def table_check():
+    print(f"\n{BOLD}== 8. TABLES AND ALIGNMENT =={OFF}")
+    print(f"{DIM}8a  expect: each row reads right-to-left inside its cell; columns keep their order{OFF}")
+    rows = [
+        ["الخميس", "1", "أكتوبر", "04:54", "06:18", "12:22"],
+        ["الجمعة", "2", "أكتوبر", "04:55", "06:19", "12:22"],
+        ["السبت", "10", "نوفمبر", "04:56", "06:20", "12:21"],
+    ]
+    for r in rows:
+        print("    " + cells(r))
+
+    print(f"{DIM}8b  expect: box borders line up; text right-aligned in each cell{OFF}")
+    data = [["الظهر", "12:22"], ["العصر", "15:38"], ["المغرب", "18:05"], ["العشاء", "19:30"]]
+    shown = [[fix(c) for c in row] for row in data]
+    widths = [max(len(row[i]) for row in shown) for i in range(2)]
+    line = "    +" + "+".join("-" * (w + 2) for w in widths) + "+"
+    print(line)
+    for row in shown:
+        print("    | " + " | ".join(c.rjust(w) for c, w in zip(row, widths)) + " |")
+    print(line)
+
+    print(f"{DIM}8c  expect: right edge of every bar lines up (word right-aligned to col 40){OFF}")
+    for t in ["الظهر -42 د", "الفجر +12 د", "العصر 15:38", "المغرب 18:05"]:
+        print("    " + fix(t).rjust(40, " ") + " |")
+
+    print(f"{DIM}8d  expect: centered text sits in the middle of the ruler{OFF}")
+    print("    " + "0123456789" * 4)
+    for t in ["الظهر", "الخميس 01 أكتوبر 2026"]:
+        print("    " + fix(t).center(40) + "|")
+
+
+# 6k: NFKC expands the salawat ligature into 4 words, so it cannot round-trip
+SKIP_RT = {"6k"}
+
+
+def roundtrip_check():
+    print(f"\n{BOLD}== AUTOMATIC ROUND-TRIP CHECK (no eyes needed) =={OFF}")
+    print(f"{DIM}unfix(fix(x)) must give back x (after NFKC, marks/tatweel/diacritics removed, "
+          f"spaces collapsed){OFF}")
+    if PUNCT_MODE == "space":
+        print("skipped: PUNCT_MODE='space' cannot be undone")
+        return
+    bad = 0
+    for _, cid, text, _ in CASES:
+        if cid in SKIP_RT:
+            continue
+        got, want = norm(unfix(fix(text))), norm(text)
+        if DIGITS_MODE == "ascii":
+            want = want.translate(_TO_ASCII)
+        if got != want:
+            bad += 1
+            print(f"FAIL {cid}\n     want {want!r}\n     got  {got!r}")
+    total = len(CASES) - len(SKIP_RT)
+    print(f"{total - bad}/{total} passed" + ("" if not bad else f"   ({bad} failed)"))
+
+
+def experiments():
+    print(f"{BOLD}== EXPERIMENTS: same line, several treatments. Tell me which label is right =={OFF}")
+
+    print(f"\n{BOLD}E1. Arabic-script digits (kept as Arabic-Indic / Persian){OFF}")
+    print(f"{DIM}digit key: ٠=0  ١=1  ٢=2  ٣=3  ٤=4  ٥=5   (۱=1 ۲=2 are the Persian shapes){OFF}")
+    print(f"{DIM}right answers, written with ordinary digits so kitty cannot reverse this text:{OFF}")
+    print(f"{DIM}  2h: after the word, the time reads 12:30 (1 then 2, colon, 3 then 0){OFF}")
+    print(f"{DIM}  2i: the number reads 12 (1 on the left of 2) and د is on the LEFT of the number{OFF}")
+    print(f"{DIM}  2o: 3 then س, and the number reads 20 (2 on the left of 0) with د on the LEFT of it{OFF}")
+    print(f"{DIM}  d20: the number reads 20 and د is on the RIGHT of the number{OFF}")
+    for label, text in [("2h", "الساعة ١٢:٣٠"), ("2i", "مدة ۱۲د"), ("2o", "٣س ٢٠د"), ("d20", "د٢٠")]:
+        for mode in ("rev", "split", "ascii"):
+            print(f"  {label}-{mode:<5} {fix(text, digits=mode)}")
+
+    print(f"\n{BOLD}E2. Arabic punctuation glued to words{OFF}")
+    print(f"{DIM}right answer: ؟ at the LEFT end of بخير, ؛ at the LEFT end of نعم, "
+          f"، at the LEFT end of each word{OFF}")
+    for label, text in [("3p", "هل أنت بخير؟ نعم؛ حسنا"), ("3o", "الظهر، العصر، المغرب"),
+                        ("3w", "ماذا تريد؟")]:
+        for mode in ("asis", "move", "space"):
+            print(f"  {label}-{mode:<5} {fix(text, punct=mode)}")
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if "exp" in args:
+        experiments()
+        sys.exit()
+    wanted = {int(a) for a in args if a.isdigit()}
+    if "--check" not in args:
+        visual_check(wanted)
+        if not wanted or 8 in wanted:
+            table_check()
+    roundtrip_check()
