@@ -1,4 +1,4 @@
-# arfix
+# ArKitty
 
 Readable Arabic in the [kitty](https://sw.kovidgoyal.net/kitty/) terminal.
 
